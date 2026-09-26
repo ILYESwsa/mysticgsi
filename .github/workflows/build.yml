@@ -25,6 +25,10 @@ on:
         description: "Keep apps the ROM patch set would remove"
         type: boolean
         default: false
+      inspect_only:
+        description: "Just download and list the archive's contents, skip the build"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -67,7 +71,55 @@ jobs:
       - name: Build native Android tools
         run: .venv/bin/python tools/build_android_tools.py
 
+      - name: Download only (inspect mode)
+        if: inputs.inspect_only == true
+        run: |
+          set -o pipefail
+          mkdir -p tmp/inspect
+          dest="tmp/inspect/firmware_pkg"
+          if [[ "${{ inputs.source }}" =~ ^https?:// ]]; then
+            aria2c -x8 -s8 -o firmware_pkg -d tmp/inspect "${{ inputs.source }}"
+          else
+            cp "${{ inputs.source }}" "$dest"
+          fi
+          echo "== file type ==" | tee inspect.log
+          file "$dest" | tee -a inspect.log
+          echo "== top-level listing (zip) ==" | tee -a inspect.log
+          python3 - "$dest" <<'PYEOF' | tee -a inspect.log
+import sys, zipfile
+path = sys.argv[1]
+try:
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            print(f"{info.file_size:>12}  {info.filename}")
+except zipfile.BadZipFile as e:
+    print(f"Not a plain zip / BadZipFile: {e}")
+PYEOF
+          echo "== nested archive scan (any zip/rar/apk-like member) ==" | tee -a inspect.log
+          python3 - "$dest" <<'PYEOF' | tee -a inspect.log
+import sys, zipfile
+path = sys.argv[1]
+exts = ('.zip', '.rar', '.app', '.tar', '.tar.md5', '.pac', '.kdz', '.dz', '.ozip')
+try:
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            low = info.filename.lower()
+            if low.endswith(exts) or 'update' in low:
+                print(f"CANDIDATE: {info.filename}  ({info.file_size} bytes)")
+except zipfile.BadZipFile:
+    pass
+PYEOF
+
+      - name: Upload inspection result
+        if: inputs.inspect_only == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspect-${{ inputs.name }}
+          path: inspect.log
+          retention-days: 7
+
       - name: Run build
+        if: inputs.inspect_only == false
         run: |
           set -o pipefail
           ARGS=(build "${{ inputs.name }}" "${{ inputs.source }}" --type "${{ inputs.rom_type }}")
@@ -77,7 +129,7 @@ jobs:
           .venv/bin/python cli.py "${ARGS[@]}" 2>&1 | tee build.log
 
       - name: Snapshot work dir on failure
-        if: always()
+        if: always() && inputs.inspect_only == false
         run: |
           mkdir -p debug
           cp build.log debug/ 2>/dev/null || true
@@ -85,7 +137,7 @@ jobs:
           find "tmp/${{ inputs.name }}/images" -maxdepth 2 -exec ls -la {} \; > debug/images_listing.txt 2>&1 || true
 
       - name: Upload log (always)
-        if: always()
+        if: always() && inputs.inspect_only == false
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ inputs.name }}
