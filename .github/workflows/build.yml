@@ -1,0 +1,83 @@
+name: Build GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Short build name (out/<name>/)"
+        required: true
+      source:
+        description: "Firmware URL or path in repo"
+        required: true
+      rom_type:
+        description: "ROM type (auto, hyperos, coloros, oneui, pixel, ...)"
+        required: false
+        default: "auto"
+      add_tag:
+        description: "Extra tag appended to build name"
+        required: false
+        default: ""
+      compress:
+        description: "Also produce a .zip"
+        type: boolean
+        default: true
+      no_debloat:
+        description: "Keep apps the ROM patch set would remove"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv erofs-utils aria2 patch \
+            default-jre-headless curl build-essential cmake ninja-build pkg-config \
+            perl golang-go libgtest-dev libusb-1.0-0-dev libpcre2-dev \
+            libprotobuf-dev protobuf-compiler libbrotli-dev liblz4-dev libzstd-dev
+
+      - name: Install apktool
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          apktool_version=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+          curl -fL -o "$HOME/.local/bin/apktool.jar" \
+            "https://github.com/iBotPeaches/Apktool/releases/download/${apktool_version}/apktool_${apktool_version#v}.jar"
+          printf '#!/bin/sh\nexec java -jar "%s/.local/bin/apktool.jar" "$@"\n' "$HOME" > "$HOME/.local/bin/apktool"
+          chmod +x "$HOME/.local/bin/apktool"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Python venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Build native Android tools
+        run: .venv/bin/python tools/build_android_tools.py
+
+      - name: Run build
+        run: |
+          ARGS=(build "${{ inputs.name }}" "${{ inputs.source }}" --type "${{ inputs.rom_type }}")
+          if [ -n "${{ inputs.add_tag }}" ]; then ARGS+=(--add "${{ inputs.add_tag }}"); fi
+          if [ "${{ inputs.compress }}" = "true" ]; then ARGS+=(--compress); fi
+          if [ "${{ inputs.no_debloat }}" = "true" ]; then ARGS+=(--no-debloat); fi
+          .venv/bin/python cli.py "${ARGS[@]}"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsi-${{ inputs.name }}
+          path: out/${{ inputs.name }}/**
+          retention-days: 7
