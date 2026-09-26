@@ -1412,10 +1412,11 @@ class RomPorter:
         ]
 
         for prop in (system_prop, product_prop):
-            build_id_key = prop.exists_any(props)[0]
-            build_id_value = "Ported.Using.MysticGSI.Tool"
-
-            fsops.set_props(prop.path, build_id_key, build_id_value)
+            # A product build.prop may be empty (see patch()).
+            keys = prop.exists_any(props)
+            if keys:
+                fsops.set_props(prop.path, keys[0],
+                                "Ported.Using.MysticGSI.Tool")
 
     def _nuke_ab_files(self):
         system = self._get_system_root()
@@ -1607,36 +1608,50 @@ class RomPorter:
                 path = os.path.join(self.partition_dirs[partition], framework)
                 if not os.path.exists(path):
                     continue
-                fsops.run(["apktool", "d", "-f", "-b", path])
-                out_dir = f"{os.path.basename(path)}.out"
-                if not os.path.exists(out_dir):
-                    continue
-                for patch_file in patches_data[partition][framework]:
-                    patch_file_path = os.path.join(
-                        rom_patches_dir, "framework-patches",
-                        f"{patch_file}.patch")
-                    fsops.run(
-                        ["patch", "-p0", "-s", "-t", "-N",
-                         "--no-backup-if-mismatch"],
-                        cwd=out_dir,
-                        stdin=patch_file_path,
-                    )
+                with tempfile.TemporaryDirectory() as tmp:
+                    self._patch_framework(
+                        path, framework, patches_data[partition][framework],
+                        rom_patches_dir, os.path.join(tmp, "out"))
 
-                fsops.run(["apktool", "b", "-o", os.path.abspath(path)],
-                          cwd=out_dir)
-                fsops.rmrf(out_dir)
+    def _patch_framework(self, path, framework, patch_names,
+                         rom_patches_dir, out_dir):
+        # -o because apktool 2 and 3 put the default output in different
+        # places; --no-debug-info because apktool 3 dropped its -b form.
+        if fsops.run(["apktool", "d", "-f", "--no-debug-info",
+                      "-o", out_dir, path]) != 0:
+            self.log(f"apktool failed to decode {framework}; "
+                     "skipping its patches")
+            return
+        for patch_file in patch_names:
+            patch_file_path = os.path.join(
+                rom_patches_dir, "framework-patches", f"{patch_file}.patch")
+            fsops.run(
+                ["patch", "-p0", "-s", "-t", "-N", "--no-backup-if-mismatch"],
+                cwd=out_dir,
+                stdin=patch_file_path,
+            )
+
+        if fsops.run(["apktool", "b", "-o", os.path.abspath(path)],
+                     cwd=out_dir) != 0:
+            self.log(f"apktool failed to rebuild {framework}; "
+                     "keeping the stock one")
 
     def _find_partition_dir(self, partition: str) -> str | None:
         if partition in self.partition_dirs:
             return self.partition_dirs[partition]
 
         system = self.partition_dirs['system']
-
-        if os.path.exists(os.path.join(system, partition, 'etc/build.prop')):
-            return os.path.join(system, partition)
-        elif os.path.exists(os.path.join(
-                system, 'system', partition, 'etc/build.prop')):
-            return os.path.join(system, 'system', partition)
+        candidates = (os.path.join(system, partition),
+                      os.path.join(system, 'system', partition))
+        for path in candidates:
+            if os.path.exists(os.path.join(path, 'etc/build.prop')):
+                return path
+        # Some ROMs (e.g. HarmonyOS) ship product without a build.prop. The
+        # root entry is then usually an empty mountpoint or a symlink.
+        for path in candidates:
+            if (os.path.isdir(path) and not os.path.islink(path)
+                    and os.listdir(path)):
+                return path
 
         return None
 
@@ -1659,6 +1674,10 @@ class RomPorter:
             if not product:
                 raise RuntimeError("product not found")
             self.partition_dirs['product'] = product
+            # Patch sets append product props here; Android loads it if
+            # present, so an empty one is fine where the ROM has none.
+            if not self._get_partition_prop("product"):
+                fsops.touch(os.path.join(product, "etc/build.prop"))
 
             system_ext = self._find_partition_dir("system_ext")
             if system_ext:
