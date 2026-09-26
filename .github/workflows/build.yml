@@ -69,13 +69,31 @@ jobs:
 
       - name: Run build
         run: |
+          set -o pipefail
           ARGS=(build "${{ inputs.name }}" "${{ inputs.source }}" --type "${{ inputs.rom_type }}")
           if [ -n "${{ inputs.add_tag }}" ]; then ARGS+=(--add "${{ inputs.add_tag }}"); fi
           if [ "${{ inputs.compress }}" = "true" ]; then ARGS+=(--compress); fi
           if [ "${{ inputs.no_debloat }}" = "true" ]; then ARGS+=(--no-debloat); fi
-          .venv/bin/python cli.py "${ARGS[@]}"
+          .venv/bin/python cli.py "${ARGS[@]}" 2>&1 | tee build.log
+
+      - name: Snapshot work dir on failure
+        if: always()
+        run: |
+          mkdir -p debug
+          cp build.log debug/ 2>/dev/null || true
+          find "tmp/${{ inputs.name }}" -maxdepth 4 > debug/tmp_tree.txt 2>&1 || true
+          find "tmp/${{ inputs.name }}/images" -maxdepth 2 -exec ls -la {} \; > debug/images_listing.txt 2>&1 || true
+
+      - name: Upload log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.name }}
+          path: debug/**
+          retention-days: 7
 
       - name: Upload result
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: gsi-${{ inputs.name }}
