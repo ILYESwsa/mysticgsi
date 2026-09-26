@@ -9,6 +9,9 @@ import glob
 import os
 import re
 import shutil
+import tempfile
+
+import lz4.frame
 
 try:
     import zstandard
@@ -38,17 +41,24 @@ def _remove(path: str):
 
 
 def normalize_partition_filename(filename: str) -> str:
-    name = filename.strip()
+    name = filename.strip().lower()
+    if name.endswith('.lz4'):
+        name = name[:-4]
 
     for suffix in FILENAME_SUFFIXES:
         if name.endswith(suffix):
             name = name[:-len(suffix)] + '.img'
             break
 
+    for extension in IMAGE_EXTENSIONS:
+        if name.endswith(extension):
+            name = name[:-len(extension)] + '.img'
+            break
+
     if name.endswith('_a.img'):
         name = name[:-6] + '.img'
 
-    if not name.endswith(('.img', '.bin')):
+    if not name.endswith('.img'):
         name += '.img'
 
     return name.lower()
@@ -65,7 +75,7 @@ def is_wanted(filename: str, targets: Set[str]) -> bool:
     named after a target partition or super. Containers, transfer lists,
     SIN files, sparse chunks etc. are always kept.
     """
-    if not filename.lower().endswith(IMAGE_EXTENSIONS):
+    if not filename.lower().endswith(IMAGE_EXTENSIONS + ('.lz4',)):
         return True
     part = partition_of(filename)
     return part in targets or 'super' in part
@@ -73,6 +83,24 @@ def is_wanted(filename: str, targets: Set[str]) -> bool:
 
 def _staged(staging_dir: str, pattern: str):
     return glob.glob(os.path.join(staging_dir, pattern), recursive=True)
+
+
+def _decompress_lz4(staging_dir: str, logger):
+    for path in _staged(staging_dir, '**/*.lz4'):
+        dest = path[:-4]
+        if logger:
+            logger(f"Decompressing {os.path.basename(path)}...")
+        fd, temp_path = tempfile.mkstemp(
+            prefix='lz4-', suffix='.img', dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, 'wb') as out_f:
+                with lz4.frame.open(path, 'rb') as in_f:
+                    shutil.copyfileobj(in_f, out_f, 1024 * 1024)
+            os.replace(temp_path, dest)
+        except (OSError, RuntimeError) as error:
+            _remove(temp_path)
+            raise RuntimeError(f"Failed to decompress {path}: {error}")
+        _remove(path)
 
 
 def _rebuild_sdat(staging_dir: str, logger):
@@ -133,7 +161,7 @@ def _finalize_image(img_path: str, dest_path: str, logger):
         if sparse.unsparse(img_path, dest_path):
             _remove(img_path)
         else:
-            shutil.move(img_path, dest_path)
+            raise RuntimeError(f"Failed to unsparse {name}")
     else:
         shutil.move(img_path, dest_path)
 
@@ -160,15 +188,44 @@ def postprocess_extracted_images(
         sin.extract_sin(s_file, staging_dir, logger=logger)
         _remove(s_file)
 
+    _decompress_lz4(staging_dir, logger)
     _rebuild_sdat(staging_dir, logger)
     _merge_sparse_chunks(staging_dir, logger)
 
-    for s_img in _staged(staging_dir, "*super*.img"):
-        if os.path.isfile(s_img):
-            lp_super.unpack_super(
-                s_img, staging_dir, target_partitions=target_partitions,
-                logger=logger)
-            _remove(s_img)
+    super_images = (_staged(staging_dir, "**/*super*.img")
+                    + _staged(staging_dir, "**/*super*.bin"))
+    metadata_images = {
+        os.path.dirname(path): path for path in super_images
+        if os.path.basename(path).lower() == 'super_metadata.img'
+    }
+    for s_img in super_images:
+        base_name = os.path.basename(s_img).lower()
+        if (not os.path.isfile(s_img)
+                or base_name == 'super_metadata.img'):
+            continue
+        metadata_path = (metadata_images.get(os.path.dirname(s_img))
+                         if base_name == 'super.img' else None)
+        with tempfile.TemporaryDirectory(
+                prefix='super-partitions-', dir=staging_dir) as scratch:
+            extracted = lp_super.unpack_super(
+                s_img, scratch, target_partitions=target_partitions,
+                logger=logger, metadata_path=metadata_path)
+            for path in extracted:
+                name = normalize_partition_filename(os.path.basename(path))
+                destination = os.path.join(staging_dir, name)
+                candidate = os.path.join(scratch, 'converted.img')
+                _finalize_image(path, candidate, logger)
+                if os.path.exists(destination):
+                    previous = os.path.join(scratch, 'previous.img')
+                    _finalize_image(destination, previous, logger)
+                    os.replace(previous, destination)
+                # Factory supers can contain empty customization filesystems
+                # alongside a populated version in a separate Open image.
+                if (not os.path.exists(destination)
+                        or os.path.getsize(candidate)
+                        > os.path.getsize(destination)):
+                    os.replace(candidate, destination)
+        _remove(s_img)
 
     all_files = [os.path.join(root, f)
                  for root, _, files in os.walk(staging_dir) for f in files]

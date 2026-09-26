@@ -3,9 +3,11 @@
 from typing import Dict, List, Optional, Set
 import hashlib
 import os
+import shutil
 import struct
 import tempfile
 
+from ...fs.detect import detect_filesystem
 from . import sparse
 
 LP_METADATA_GEOMETRY_MAGIC = 0x616C4467
@@ -169,30 +171,79 @@ def is_super_image(file_path: str) -> bool:
 
 
 def _write_partition(f, part: LpPartition, out_path: str):
+    with tempfile.TemporaryDirectory(
+            prefix='lp-partition-', dir=os.path.dirname(out_path)) as scratch:
+        candidate = os.path.join(scratch, 'partition.img')
+        _copy_partition(f, part, candidate)
+        os.replace(candidate, out_path)
+
+
+def _copy_partition(f, part: LpPartition, out_path: str):
     with open(out_path, 'wb') as out_f:
         out_size = 0
         for ext in part.extents:
             if ext.target_type == LP_TARGET_TYPE_LINEAR:
+                if ext.target_source != 0:
+                    raise RuntimeError(
+                        f"Unsupported LP block device for {part.name}")
                 f.seek(ext.file_offset)
                 remaining = ext.num_bytes
                 while remaining > 0:
                     buf = f.read(min(remaining, MB))
                     if not buf:
-                        break
+                        raise RuntimeError(
+                            f"Truncated LP extent for {part.name}")
                     out_f.write(buf)
                     remaining -= len(buf)
                     out_size += len(buf)
             elif ext.target_type == LP_TARGET_TYPE_ZERO:
                 out_f.seek(ext.num_bytes, os.SEEK_CUR)
                 out_size += ext.num_bytes
+            else:
+                raise RuntimeError(
+                    f"Unsupported LP extent type for {part.name}")
         out_f.truncate(out_size)
+
+
+def _extract_system_payload(active_path: str, output_dir: str,
+                            metadata_path: str, temp_raw: Optional[str],
+                            targets: Optional[Set[str]]) -> Optional[str]:
+    if targets is not None and 'system' not in targets:
+        return None
+
+    with open(metadata_path, 'rb') as metadata_file:
+        partitions = read_lp_metadata(metadata_file)
+    if partitions is None:
+        return None
+
+    system = partitions.get('system_a') or partitions.get('system')
+    if system is None or len(system.extents) != 1:
+        return None
+    extent = system.extents[0]
+    if (extent.target_type != LP_TARGET_TYPE_LINEAR
+            or extent.target_source != 0
+            or extent.num_bytes != os.path.getsize(active_path)
+            or detect_filesystem(active_path) == 'unknown'):
+        return None
+
+    out_path = os.path.join(output_dir, 'system.img')
+    if temp_raw:
+        os.replace(temp_raw, out_path)
+    else:
+        with tempfile.TemporaryDirectory(
+                prefix='lp-system-', dir=output_dir) as scratch:
+            candidate = os.path.join(scratch, 'system.img')
+            shutil.copyfile(active_path, candidate)
+            os.replace(candidate, out_path)
+    return out_path
 
 
 def unpack_super(
     super_path: str,
     output_dir: str,
     target_partitions: Optional[Set[str]] = None,
-    logger=None
+    logger=None,
+    metadata_path: Optional[str] = None
 ) -> List[str]:
     """Extract dynamic partitions from a raw or sparse super.img."""
     if not os.path.isfile(super_path):
@@ -201,6 +252,7 @@ def unpack_super(
     os.makedirs(output_dir, exist_ok=True)
     temp_raw = None
     active_path = super_path
+    supplied = None
 
     try:
         if sparse.is_sparse(super_path):
@@ -209,7 +261,8 @@ def unpack_super(
             fd, temp_raw = tempfile.mkstemp(
                 prefix="super_raw_", suffix=".img", dir=output_dir)
             os.close(fd)
-            if not sparse.unsparse(super_path, temp_raw):
+            supplied = []
+            if not sparse.unsparse(super_path, temp_raw, supplied=supplied):
                 if logger:
                     logger("Failed to unsparse super.img")
                 return []
@@ -218,6 +271,17 @@ def unpack_super(
         with open(active_path, 'rb') as f:
             partitions = read_lp_metadata(f)
             if partitions is None:
+                f.close()
+                targets = ({p.lower() for p in target_partitions}
+                           if target_partitions else None)
+                if metadata_path:
+                    system_path = _extract_system_payload(
+                        active_path, output_dir, metadata_path, temp_raw,
+                        targets)
+                    if system_path:
+                        if logger:
+                            logger('Extracting system from super.img...')
+                        return [system_path]
                 if logger:
                     logger("No valid LP metadata found in super.img")
                 return []
@@ -232,6 +296,13 @@ def unpack_super(
                         and base_name.lower() not in targets):
                     continue
                 if part.num_bytes == 0:
+                    continue
+                if supplied is not None and not any(
+                        left < ext.file_offset + ext.num_bytes
+                        and right > ext.file_offset
+                        for ext in part.extents
+                        if ext.target_type == LP_TARGET_TYPE_LINEAR
+                        for left, right in supplied):
                     continue
                 # With both slots populated, slot a is the one postprocess
                 # keeps; extracting b too only wastes time and disk.

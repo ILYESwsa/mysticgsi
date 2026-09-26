@@ -36,6 +36,8 @@
             android-tools    # mke2fs.android, e2fsdroid
             apktool          # framework jar patches
             gnupatch
+            libarchive       # bsdtar, for RAR firmware packages
+            openssl          # AVB image signing
           ];
         in
         {

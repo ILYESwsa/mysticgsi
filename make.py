@@ -12,6 +12,7 @@ from assets import ensure_extracted
 import fsops
 import tools
 from tools.config import DEFAULT_PARTITIONS
+from tools.isa import find_cpu_features
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
@@ -235,7 +236,7 @@ class SettingsProp:
             "ro.product.system.manufacturer",
             "ro.product.product.manufacturer")
 
-    def get_android_version(self) -> int | str | None:
+    def get_android_version(self) -> str:
         codename = self.values.get("ro.build.version.codename")
         known_codenames = self.values.get("ro.build.version.known_codenames")
         if known_codenames and codename and str(codename) in known_codenames:
@@ -249,7 +250,7 @@ class SettingsProp:
                 "build.prop has no Android version "
                 "(ro.system.build.version.release / "
                 "ro.build.version.release)")
-        return int(raw)
+        return raw
 
     def get_market_name(self):
         return self.first_of(
@@ -307,7 +308,7 @@ class RomPorter:
         self.images_dir = ""
         self.logger = StubLogger()
         self.image_files = {}
-        self.partition_dirs:dict[str, str] = {}
+        self.partition_dirs: dict[str, str] = {}
         # Partition -> {path in its image: SELinux label}.
         self.stock_labels: dict[str, dict[str, str]] = {}
         self.rom_name = safe_name(rom_name, "rom_name")
@@ -317,8 +318,10 @@ class RomPorter:
         self.is_64bit_only = False
         self.programs_32bit_only = []
         self.debloat = True
+        self.avb_key = None
         self.work_dir = f"{tmp_dir}/{rom_name}"
         self.props: dict[str, SettingsProp] = {}
+        self.cpu_warning = ""
 
     def log(self, message):
         self.logger.add(message)
@@ -464,16 +467,22 @@ class RomPorter:
                         self.rom_type = rom
                         return
 
+    def _rom_type_name(self):
+        if self.rom_type == 'alos':
+            return 'AluminiumOS'
+        return self.rom_type.capitalize()
+
     def get_display_name(self):
-        self.android_version = str(self._get_partition_prop("system").get_android_version())
         system_prop = self._get_partition_prop("system")
+        self.android_version = str(system_prop.get_android_version())
         product_prop = self._get_partition_prop("product")
 
         try:
             # OneUI
             if self.rom_type == "oneui":
                 # e.g. 60101 -> 6.1.1, 60100 -> 6.1
-                oneui_version = system_prop.values.get("ro.build.version.oneui")
+                oneui_version = system_prop.get_value(
+                    "ro.build.version.oneui")
                 if oneui_version and len(oneui_version) == 5:
                     oneui_major = oneui_version[0]
                     oneui_build = oneui_version[2]
@@ -595,7 +604,7 @@ class RomPorter:
             self.log(f"Failed to determine the ROM display name: {e}")
             traceback.print_exc()
 
-        result = self.rom_type.capitalize()
+        result = self._rom_type_name()
         if not self.android_version.isdigit():
             result += f" Android {self.android_version}"
         else:
@@ -621,7 +630,7 @@ class RomPorter:
         for file in useless_files:
             fsops.rmrf(os.path.join(self.partition_dirs['system'], file))
 
-        # Remove Dolphin lib. (otherwise causes a surfaceflinger crash on some ROMs.)
+        # Dolphin can crash surfaceflinger on some ROMs.
         dolphin_lib_path = 'lib64/libdolphin.so'
 
         fsops.rmrf(os.path.join(system, dolphin_lib_path))
@@ -720,7 +729,8 @@ class RomPorter:
     def _patch_framework_jars(self):
         if not ((self.rom_type in ("miui", "hyperos")
                  and self._is_android_version(14))
-                or (self.rom_type == "nothing" and self._is_android_version(13))):
+                or (self.rom_type == "nothing"
+                    and self._is_android_version(13))):
             return
         with tempfile.TemporaryDirectory(prefix="framework-",
                                          dir=self.work_dir) as workdir:
@@ -730,7 +740,7 @@ class RomPorter:
         if not self._is_android_version(14):
             return
 
-        # Fix of brightness bug that appears in ports from Xiaomi 14 (HyperOS 1.0 only)
+        # Fix brightness in Xiaomi 14 ports (HyperOS 1.0 only).
         system_ext = self.partition_dirs['system_ext']
         miui_services_path = os.path.join(
             system_ext, 'framework', 'miui-services.jar')
@@ -780,8 +790,7 @@ class RomPorter:
 
         patched = False
 
-        # Patching the ChargeLevelUpdater so it never runs as it may cause a bootloop.
-        # because it depends on Nothing's HALs.
+        # ChargeLevelUpdater depends on Nothing's HALs and can bootloop.
         charge_updater = (f"{out_dir}/smali_classes2/com/nothing/server/"
                           "BatteryChargeManager$ChargeLevelUpdater.smali")
         if os.path.exists(charge_updater):
@@ -1153,6 +1162,82 @@ class RomPorter:
             fsops.rmrf(bootanimation_path)
             fsops.move(dark_bootanimation_path, bootanimation_path)
 
+    def _patch_alos(self):
+        system = self._get_system_root()
+        system_ext = self.partition_dirs.get('system_ext')
+        product_prop = self._get_partition_prop('product')
+
+        matrix = os.path.join(
+            system, 'etc/vintf/compatibility_matrix.device.xml')
+        vpd_hal = (
+            r'(?m)^    <hal format="aidl">\n'
+            r'        <name>vendor\.google\.desktop\.vpd_executor</name>\n'
+            r'        <interface>\n'
+            r'            <name>IVpdExecutor</name>\n'
+            r'            <instance>default</instance>\n'
+            r'        </interface>\n'
+            r'    </hal>\n'
+        )
+        if os.path.isfile(matrix):
+            fsops.sub_lines(matrix, vpd_hal, '')
+
+        if product_prop:
+            if not fsops.set_props(product_prop.path,
+                                   'ro.setupwizard.require_network', 'false'):
+                fsops.append_text(product_prop.path,
+                                  'ro.setupwizard.require_network=false')
+
+        for path in (
+                'etc/init/gscd.rc',
+                'etc/init/gscutil-executor.rc',
+                'etc/init/gscutil.rc',
+                'etc/init/timberslide.rc',
+                'etc/init/udsattestation.rc',
+                'etc/vintf/manifest/manifest_gscd.xml'):
+            fsops.rmrf(os.path.join(system, path))
+
+        if not system_ext:
+            return
+
+        for path in (
+                'etc/init/vendor.qti.hardware.qccsyshal@1.2-service.rc',
+                'etc/init/vendor.qti.qccsyshal_aidl-service.rc',
+                'etc/vintf/manifest/vendor.qti.qccsyshal_aidl-service.xml'):
+            fsops.rmrf(os.path.join(system_ext, path))
+
+        contexts = os.path.join(
+            system_ext, 'etc/selinux/system_ext_service_contexts')
+        for service in (
+                'android.hardware.security.keymint.IKeyMintDevice/default',
+                'android.hardware.gatekeeper.IGatekeeper/default',
+                'android.os.IAccessor/ICommService/security_vm_keymint',
+                'android.os.IAccessor/IGatekeeper/security_vm_gatekeeper',
+                'android.os.IAccessor/sharedsecret/security_vm_shared_secret',
+                'android.keymint.trusty.commservice.ICommService/'
+                'security_vm_keymint',
+                'android.os.IAccessor/IKeyMintProvisioningService/'
+                'security_vm_keymint',
+                'android.os.IAccessor/IVmAttestation/default',
+                'android.trusty.vm_attestation.IVmAttestation/default',
+                'android.hardware.security.keymint.IKeyMintDevice/strongbox',
+                'android.hardware.security.sharedsecret.'
+                'ISharedSecret/strongbox',
+                'android.hardware.security.keymint.'
+                'IRemotelyProvisionedComponent/strongbox',
+                'android.media.audio.'
+                'IHalAdapterVendorExtension/default',
+                'com.google.android.system.desktop.IGscutilExecutor/default'):
+            fsops.drop_lines(contexts, r'^' + re.escape(service) + r'\s')
+
+        sepolicy = os.path.join(
+            system_ext, 'etc/selinux/system_ext_sepolicy.cil')
+        for path in (
+                '/mnt/super_partition_utils',
+                '/firmware/vpd/ro/attested_device_id',
+                '/firmware/vpd/ro/serial_number'):
+            fsops.drop_lines(sepolicy, r'^\(genfscon [^ ]+ "'
+                             + re.escape(path) + r'" ')
+
     def _get_system_root(self) -> str:
         system = self.partition_dirs['system']
 
@@ -1170,10 +1255,12 @@ class RomPorter:
         part = self.partition_dirs.get(part_name)
         if not part:
             return None
-        if not os.path.exists(os.path.join(part, "etc/build.prop" if part_name == 'odm' else "build.prop")):
+        prop_path = os.path.join(
+            part, "etc/build.prop" if part_name == "odm" else "build.prop")
+        if not os.path.exists(prop_path):
             return None
         prop = SettingsProp()
-        prop.init_from_file(os.path.join(part, 'etc/build.prop' if part_name == 'odm' else 'build.prop'))
+        prop.init_from_file(prop_path)
         model = prop.get_device_model()
         if part_name == 'odm':
             for name in (f"etc/{model}_build.prop", f"etc/{model}.build.prop"):
@@ -1294,14 +1381,17 @@ class RomPorter:
             return True
 
         sdk = str(self._get_partition_prop("system").get_sdk_version())
+        if target_str.isdigit() and target_str in SDK_MAP:
+            next_sdk = SDK_MAP.get(str(int(target_str) + 1))
+            if next_sdk:
+                return int(SDK_MAP[target_str]) <= int(sdk) < int(next_sdk)
         return SDK_MAP.get(target_str) == sdk
 
     def _is_android_at_least(self, minimal_version: int) -> bool:
-        try:
-            ver = int(self._get_partition_prop("system").get_android_version())
-            return ver >= minimal_version
-        except (ValueError, TypeError):
+        sdk = SDK_MAP.get(str(minimal_version))
+        if sdk is None:
             return False
+        return self._get_partition_prop("system").get_sdk_version() >= int(sdk)
 
     # _is_android_at_least_11 == self._is_android_at_least(11)
     # _is_android_11 == _is_android_version(11)
@@ -1322,36 +1412,43 @@ class RomPorter:
                 return val
 
         return self._first_prop(
-            (self._get_part_prop('vendor'), self._get_partition_prop("product"),
+            (self._get_part_prop('vendor'),
+             self._get_partition_prop("product"),
              self._get_partition_prop("system")),
             SettingsProp.get_device_model, "unknown")
 
     def _get_device_codename(self) -> str:
         return self._first_prop(
             (self._get_part_prop('odm'), self._get_partition_prop("product"),
-             self._get_part_prop('vendor'), self._get_partition_prop("system")),
+             self._get_part_prop('vendor'),
+             self._get_partition_prop("system")),
             SettingsProp.get_device_name, "unknown")
 
     def _get_device_manufacturer(self) -> str:
         return self._first_prop(
             (self._get_part_prop('odm'), self._get_partition_prop("system"),
-             self._get_partition_prop("product"), self._get_part_prop('vendor')),
+             self._get_partition_prop("product"),
+             self._get_part_prop('vendor')),
             SettingsProp.get_device_manufacturer, "unknown")
 
     def _get_device(self) -> str:
         return self._first_prop(
             (self._get_part_prop('odm'), self._get_part_prop('vendor'),
-             self._get_partition_prop("product"), self._get_partition_prop("system")),
+             self._get_partition_prop("product"),
+             self._get_partition_prop("system")),
             SettingsProp.get_device, "unknown")
 
     def _get_build_incremental(self) -> str:
         return self._first_prop(
-            (self._get_partition_prop("system"), self._get_partition_prop("product")),
+            (self._get_partition_prop("system"),
+             self._get_partition_prop("product")),
             SettingsProp.get_build_incremental, "")
 
     def _apply_generic_patches(self):
-        android_version = str(self._get_partition_prop("system").get_android_version())
-        patch_path = os.path.join(patches_dir, 'all', android_version)
+        system_prop = self._get_partition_prop("system")
+        android_version = str(system_prop.get_android_version())
+        patch_version = android_version.split('.', 1)[0]
+        patch_path = os.path.join(patches_dir, 'all', patch_version)
 
         if not os.path.exists(patch_path):
             return
@@ -1385,7 +1482,8 @@ class RomPorter:
         system_ext = self.partition_dirs.get("system_ext")
         system = self._get_system_root()
         android_sdk = str(self._get_partition_prop("system").get_sdk_version())
-        android_version = str(self._get_partition_prop("system").get_android_version())
+        system_prop = self._get_partition_prop("system")
+        android_version = str(system_prop.get_android_version())
         if system_ext and os.path.exists(os.path.join(system_ext, 'apex')):
             fsops.cp_r(os.path.join(system_ext, 'apex'), system)
             fsops.rmrf(os.path.join(system_ext, 'apex'))
@@ -1485,10 +1583,10 @@ class RomPorter:
     def _apply_rom_patches(self):
         self._detect_rom_type()
 
-        android_version = str(self._get_partition_prop("system").get_android_version())
-        android_sdk = str(self._get_partition_prop("system").get_sdk_version())
-        system = self._get_system_root()
         system_prop = self._get_partition_prop("system")
+        android_version = str(system_prop.get_android_version())
+        android_sdk = str(system_prop.get_sdk_version())
+        system = self._get_system_root()
         product_prop = self._get_partition_prop("product")
         system_ext_prop = self._get_partition_prop("system_ext")
         system_ext = self.partition_dirs.get("system_ext")
@@ -1496,7 +1594,7 @@ class RomPorter:
         patch_path = os.path.join(patches_dir, android_sdk)
 
         rom_patches_dir = os.path.join(patches_dir, android_sdk, self.rom_type)
-        if not android_version.isdigit():
+        if not re.fullmatch(r"\d+(?:\.\d+)*", android_version):
             rom_patches_dir = os.path.join(
                 patches_dir, android_version, self.rom_type)
 
@@ -1515,7 +1613,8 @@ class RomPorter:
 
         if not config.get("no_device_overlays", False):
             overlay_dir = os.path.join(
-                patches_dir, "all", android_version, "device_overlay")
+                patches_dir, "all", android_version.split('.', 1)[0],
+                "device_overlay")
             overlay_dst = os.path.join(product, "overlay")
             fsops.mkdirp(overlay_dst)
             ensure_extracted(overlay_dir, self.log)
@@ -1594,11 +1693,10 @@ class RomPorter:
 
         patches_json = os.path.join(rom_patches_dir, "patches.json")
         if os.path.exists(patches_json):
-            try:
-                self.log("Applying framework patches")
-                self._apply_framework_patches(patches_json, rom_patches_dir)
-            except Exception:
-                traceback.print_exc()
+            self.log("Applying framework patches")
+            self._apply_framework_patches(patches_json, rom_patches_dir)
+        if self.rom_type == 'alos':
+            self._patch_alos()
 
     def _apply_framework_patches(self, patches_json, rom_patches_dir):
         with open(patches_json, "r") as f:
@@ -1619,22 +1717,29 @@ class RomPorter:
         # places; --no-debug-info because apktool 3 dropped its -b form.
         if fsops.run(["apktool", "d", "-f", "--no-debug-info",
                       "-o", out_dir, path]) != 0:
-            self.log(f"apktool failed to decode {framework}; "
-                     "skipping its patches")
-            return
+            raise RuntimeError(f"apktool failed to decode {framework}")
         for patch_file in patch_names:
             patch_file_path = os.path.join(
                 rom_patches_dir, "framework-patches", f"{patch_file}.patch")
-            fsops.run(
+            rc = fsops.run(
                 ["patch", "-p0", "-s", "-t", "-N", "--no-backup-if-mismatch"],
                 cwd=out_dir,
                 stdin=patch_file_path,
             )
+            if rc != 0:
+                raise RuntimeError(
+                    f"Failed to apply {patch_file} to {framework} ({rc})")
 
-        if fsops.run(["apktool", "b", "-o", os.path.abspath(path)],
-                     cwd=out_dir) != 0:
-            self.log(f"apktool failed to rebuild {framework}; "
-                     "keeping the stock one")
+        with tempfile.TemporaryDirectory(
+                prefix="framework-", dir=os.path.dirname(path)) as staging:
+            rebuilt = os.path.join(staging, os.path.basename(path))
+            if fsops.run(["apktool", "b", "-o", os.path.abspath(rebuilt)],
+                         cwd=out_dir) != 0:
+                raise RuntimeError(f"apktool failed to rebuild {framework}")
+            if not os.path.isfile(rebuilt) or os.path.getsize(rebuilt) == 0:
+                raise RuntimeError(f"apktool produced no {framework}")
+            os.chmod(rebuilt, os.stat(path).st_mode & 0o7777)
+            os.replace(rebuilt, path)
 
     def _find_partition_dir(self, partition: str) -> str | None:
         if partition in self.partition_dirs:
@@ -1692,21 +1797,24 @@ class RomPorter:
             vendor = self.partition_dirs.get("vendor")
             vendor_prop = self._get_part_prop('vendor')
 
-            android_version = str(self._get_partition_prop("system").get_android_version())
-            android_sdk = str(self._get_partition_prop("system").get_sdk_version())
+            system_prop = self._get_partition_prop("system")
+            product_prop = self._get_partition_prop("product")
+            odm_prop = self._get_part_prop('odm')
+            android_version = str(system_prop.get_android_version())
+            android_sdk = str(system_prop.get_sdk_version())
             build_fingerprint = self._first_prop(
-                (self._get_part_prop('odm'), self._get_partition_prop("product"), self._get_partition_prop("system")),
+                (odm_prop, product_prop, system_prop),
                 SettingsProp.get_build_fingerprint, "")
-            build_type = self._first_prop((self._get_partition_prop("product"), self._get_partition_prop("system")),
-                                          SettingsProp.get_build_flavor, "")
-            build_id = self._get_partition_prop("system").get_build_id() or ""
-            security_patch = self._get_partition_prop("system").get_security_patch() or ""
+            build_type = self._first_prop(
+                (product_prop, system_prop), SettingsProp.get_build_flavor, "")
+            build_id = system_prop.get_build_id() or ""
+            security_patch = system_prop.get_security_patch() or ""
             build_tags = self._first_prop(
-                (self._get_part_prop('odm'), self._get_partition_prop("product"), self._get_partition_prop("system")),
+                (odm_prop, product_prop, system_prop),
                 SettingsProp.get_build_tags, "")
             device_brand = self._first_prop(
-                (self._get_part_prop('odm'), self._get_part_prop('vendor'), self._get_partition_prop("product"),
-                 self._get_partition_prop("system")), SettingsProp.get_device_brand, "unknown")
+                (odm_prop, self._get_part_prop('vendor'), product_prop,
+                 system_prop), SettingsProp.get_device_brand, "unknown")
             device_model = self._get_device_model()
             device_codename = self._get_device_codename()
             device_manufacturer = self._get_device_manufacturer()
@@ -1759,7 +1867,7 @@ class RomPorter:
             if self._is_zte_rom() and vendor_prop:
                 self._patch_zte(vendor_prop)
 
-            if self.rom_type in ['pixel']:
+            if self.rom_type in ('pixel', 'alos'):
                 self._patch_google()
 
             if self._is_xiaomi_rom():
@@ -1804,7 +1912,8 @@ Architecture: {self._architecture()}
     def _get_board(self) -> str:
         vendor_prop = self._get_partition_prop("vendor")
         if vendor_prop:
-            return vendor_prop.first_of("ro.board.platform", "ro.product.board") or "unknown"
+            return vendor_prop.first_of(
+                "ro.board.platform", "ro.product.board") or "unknown"
 
         return "unknown"
 
@@ -1873,11 +1982,40 @@ Architecture: {self._architecture()}
                   encoding="utf-8") as f:
             json.dump(labels, f)
 
+    def _warn_cpu_features(self):
+        self.cpu_warning = ""
+        system = self._get_system_root()
+        found = {}
+        for relative_path in (
+                "bin/init", "bin/bootstrap/linker64", "bin/linker64",
+                "bin/app_process64", "bin/servicemanager",
+                "bin/hwservicemanager", "bin/surfaceflinger"):
+            path = os.path.join(system, relative_path)
+            if not os.path.lexists(path) or os.path.islink(path):
+                continue
+            features = find_cpu_features(path)
+            if features is None:
+                self.log(f"Warning: could not check CPU instructions in "
+                         f"system/{relative_path}")
+                continue
+            for feature in sorted(features):
+                found.setdefault(feature, f"system/{relative_path}")
+        if found:
+            evidence = ", ".join(
+                f"{feature} ({path})"
+                for feature, path in sorted(found.items()))
+            self.cpu_warning = (
+                f"Newer ARM instructions found: {evidence}. Devices lacking "
+                "these features may fail to boot; runtime CPU checks may "
+                "provide fallbacks.")
+            self.log("Warning: " + self.cpu_warning)
+
     def _write_image(self, output_name):
         """
         Builds out/<rom_name>/<output_name>.img from the system tree, sized
-        to fit its contents. Returns the filesystem size, or None.
+        to fit its contents. Returns the signed image size, or None.
         """
+        self._warn_cpu_features()
         system_dir = self.partition_dirs['system']
         out_dir = f"out/{self.rom_name}"
         # Allocated blocks, not file sizes: small files and directories
@@ -1903,6 +2041,11 @@ Architecture: {self._architecture()}
                     or os.path.getsize(image) == 0):
                 self.log(f"Image builder failed ({rc})")
                 return None
+            self.logger.set_state("sign")
+            if tools.sign_system_image(
+                    image, logger=self.log, key_path=self.avb_key) != 0:
+                return None
+            system_size = os.path.getsize(image)
             os.replace(image, f"{out_dir}/{output_name}.img")
 
         self.output_name = output_name
@@ -1916,7 +2059,7 @@ Architecture: {self._architecture()}
         except Exception:
             self.rom_type = "generic"
         output_name = sanitize_name(
-            f"{self.rom_type.capitalize()}-{self.device_codename}"
+            f"{self._rom_type_name()}-{self.device_codename}"
             f"-{self.android_version}-{self.build_incremental}"
             f"-AB-{date}-MysticGSI")
 
@@ -1924,6 +2067,9 @@ Architecture: {self._architecture()}
             system_size = self._write_image(output_name)
             if system_size is None:
                 return -1
+            if self.cpu_warning:
+                self.build_info_text += (
+                    f"CPU compatibility: {self.cpu_warning}\n")
             self.build_info_text += (
                 f"Raw Image Size: {bytes_to_human(system_size)}\n")
             with open(f"out/{self.rom_name}/output.txt", "w") as f:
