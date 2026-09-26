@@ -84,31 +84,40 @@ jobs:
           fi
           echo "== file type ==" | tee inspect.log
           file "$dest" | tee -a inspect.log
-          echo "== top-level listing (zip) ==" | tee -a inspect.log
-          python3 - "$dest" <<'PYEOF' | tee -a inspect.log
-import sys, zipfile
-path = sys.argv[1]
-try:
-    with zipfile.ZipFile(path) as z:
-        for info in z.infolist():
-            print(f"{info.file_size:>12}  {info.filename}")
-except zipfile.BadZipFile as e:
-    print(f"Not a plain zip / BadZipFile: {e}")
-PYEOF
-          echo "== nested archive scan (any zip/rar/apk-like member) ==" | tee -a inspect.log
-          python3 - "$dest" <<'PYEOF' | tee -a inspect.log
-import sys, zipfile
-path = sys.argv[1]
-exts = ('.zip', '.rar', '.app', '.tar', '.tar.md5', '.pac', '.kdz', '.dz', '.ozip')
-try:
-    with zipfile.ZipFile(path) as z:
-        for info in z.infolist():
-            low = info.filename.lower()
-            if low.endswith(exts) or 'update' in low:
-                print(f"CANDIDATE: {info.filename}  ({info.file_size} bytes)")
-except zipfile.BadZipFile:
-    pass
-PYEOF
+          cat > /tmp/inspect_zip.py <<'PYEOF'
+          import sys, zipfile
+
+          def scan(path, prefix=""):
+              try:
+                  z = zipfile.ZipFile(path)
+              except zipfile.BadZipFile as e:
+                  print(f"{prefix}NOT A ZIP ({path}): {e}")
+                  return
+              for info in z.infolist():
+                  name = info.filename
+                  size = info.file_size
+                  print(f"{prefix}{size:>12}  {name}")
+                  low = name.lower()
+                  if low.endswith(('.zip', '.rar', '.7z')):
+                      # peek one level inside nested zip archives without
+                      # extracting to disk
+                      try:
+                          data = z.read(info)
+                      except Exception as e:
+                          print(f"{prefix}    (could not read nested archive: {e})")
+                          continue
+                      import io
+                      try:
+                          inner = zipfile.ZipFile(io.BytesIO(data))
+                          for j in inner.infolist():
+                              print(f"{prefix}    -> {j.file_size:>12}  {j.filename}")
+                      except zipfile.BadZipFile:
+                          print(f"{prefix}    -> not a nested zip (maybe rar/7z, unsupported here)")
+
+          scan(sys.argv[1])
+          PYEOF
+          echo "== full listing, 2 levels deep for nested zips ==" | tee -a inspect.log
+          python3 /tmp/inspect_zip.py "$dest" | tee -a inspect.log
 
       - name: Upload inspection result
         if: inputs.inspect_only == true
